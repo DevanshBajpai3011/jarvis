@@ -21,6 +21,11 @@ AUDIO_CHUNK_SIZE = int(os.getenv("AUDIO_CHUNK_SIZE", "1280"))
 AUDIO_RATE = int(os.getenv("AUDIO_RATE", "16000"))
 AUDIO_CHANNELS = int(os.getenv("AUDIO_CHANNELS", "1"))
 
+# Faster-Whisper device/compute-type selection. "auto" detects CUDA via ctranslate2
+# and picks float16 on GPU / int8 on CPU; set explicitly to override auto-detection.
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "auto")  # "auto" | "cuda" | "cpu"
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "auto")  # "auto" | "float16" | "int8"
+
 
 
 

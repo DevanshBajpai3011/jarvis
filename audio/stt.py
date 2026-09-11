@@ -1,15 +1,29 @@
-import torch
+import ctranslate2
 from faster_whisper import WhisperModel
+
+import config
 
 
 class SpeechToTextEngine:
     def __init__(self, model_size: str = "large-v3-turbo"):
         """
         Initializes Faster-Whisper using CTranslate2 backend.
-        Automatically selects CUDA (float16) if available, otherwise falls back to CPU (int8).
+        Device/compute type come from config.WHISPER_DEVICE / config.WHISPER_COMPUTE_TYPE.
+        "auto" (the default) selects CUDA (float16) if ctranslate2 detects a CUDA device,
+        otherwise CPU (int8). An explicit "cuda"/"cpu" or "float16"/"int8" value overrides auto-detection.
         """
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.compute_type = "float16" if self.device == "cuda" else "int8"
+        device_setting = getattr(config, "WHISPER_DEVICE", "auto")
+        compute_setting = getattr(config, "WHISPER_COMPUTE_TYPE", "auto")
+
+        if device_setting == "auto":
+            self.device = "cuda" if ctranslate2.get_cuda_device_count() > 0 else "cpu"
+        else:
+            self.device = device_setting
+
+        if compute_setting == "auto":
+            self.compute_type = "float16" if self.device == "cuda" else "int8"
+        else:
+            self.compute_type = compute_setting
 
         print(f"[STT Engine] Loading Faster-Whisper ({model_size}) on {self.device} ({self.compute_type})...")
         self.model = WhisperModel(
