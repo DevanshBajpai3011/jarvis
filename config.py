@@ -10,7 +10,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gemini-2.0-flash")
 PIPER_VOICE_MODEL = os.getenv("PIPER_VOICE_MODEL", "en_GB-alan-medium")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
 STREAMING_TTS = os.getenv("STREAMING_TTS", "true").lower() == "true"
 ENABLE_FOLLOW_UP_MODE = os.getenv("ENABLE_FOLLOW_UP_MODE", "true").lower() == "true"
 FOLLOW_UP_LISTEN_TIMEOUT = int(os.getenv("FOLLOW_UP_LISTEN_TIMEOUT", "8"))
@@ -54,8 +54,6 @@ ENABLE_OPENCLAW_GATEWAY = True
 
 # Dual-Brain Architecture parameters
 PRIMARY_MODEL = os.getenv("PRIMARY_MODEL", "gemini-2.5-flash")
-BACKGROUND_MODEL_PRIMARY = os.getenv("BACKGROUND_MODEL_PRIMARY", "meta-llama/llama-3.3-70b-instruct")
-BACKGROUND_MODEL_FALLBACK = os.getenv("BACKGROUND_MODEL_FALLBACK", "google/gemini-2.0-flash-001")
 ENABLE_DUAL_BRAIN = os.getenv("ENABLE_DUAL_BRAIN", "true").lower() == "true"
 
 # Two-Stage Cognitive Memory parameters

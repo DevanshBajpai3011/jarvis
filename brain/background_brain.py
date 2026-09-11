@@ -16,15 +16,25 @@ class BackgroundBrain:
     decoupled from the primary voice response loop.
     """
 
+    # Free-tier OpenRouter model availability rotates constantly — OpenRouter
+    # deprecates or paywalls specific ":free" model slugs without warning. That is
+    # exactly what happened to the three models previously hardcoded here (all three
+    # started returning 404 "unavailable for free" errors). A live reachability test
+    # on 2026-09-12 additionally found 8+ other well-known ":free" slugs also broken
+    # the same way. "openrouter/free" is OpenRouter's own auto-router that always
+    # selects from whatever free models are CURRENTLY available, and is deliberately
+    # kept as the primary model for exactly this reason. Do NOT "fix" a future
+    # failure here by hardcoding a fresh list of specific free model names without
+    # understanding why that's precisely what broke last time — verify with a real
+    # test call against the live OpenRouter catalog first.
     DEFAULT_FALLBACK_MODELS = [
-        "meta-llama/llama-3.3-70b-instruct:free",
-        "google/gemini-2.0-flash-lite-001:free",
-        "qwen/qwen-2.5-coder-32b-instruct:free",
+        "openrouter/free",
+        "nvidia/nemotron-3-super-120b-a12b:free",
     ]
 
     def __init__(self, api_key: str = None, model_name: str = None):
         self.api_key = api_key or getattr(config, "OPENROUTER_API_KEY", "")
-        self.model_name = model_name or getattr(config, "BACKGROUND_MODEL", "meta-llama/llama-3.3-70b-instruct:free")
+        self.model_name = model_name or getattr(config, "BACKGROUND_MODEL", "openrouter/free")
 
         self.client = None
         if self.api_key and self.api_key != "your_openrouter_api_key_here":
