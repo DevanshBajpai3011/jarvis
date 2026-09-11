@@ -1,7 +1,36 @@
+import os
+import importlib.util
 import ctranslate2
 from faster_whisper import WhisperModel
 
 import config
+
+
+def _register_cublas_dll_directory() -> None:
+    """
+    Locates the nvidia-cublas-cu12 pip package's bin folder (wherever it's actually
+    installed) and registers it both via os.add_dll_directory() and by prepending it
+    to os.environ["PATH"], so ctranslate2 can find cublas64_12.dll at inference time.
+    Both mechanisms are needed: ctranslate2's native CUDA loader only consults PATH
+    and does not honor the newer Windows AddDllDirectory API on its own (confirmed by
+    testing add_dll_directory() alone against a real recorded transcription, which
+    still failed with "Library cublas64_12.dll is not found or cannot be loaded"
+    until PATH was also set).
+    """
+    if os.name != "nt":
+        return
+    try:
+        cublas_spec = importlib.util.find_spec("nvidia.cublas")
+        if not cublas_spec or not cublas_spec.submodule_search_locations:
+            return
+        for location in cublas_spec.submodule_search_locations:
+            bin_dir = os.path.join(location, "bin")
+            if os.path.isdir(bin_dir):
+                os.add_dll_directory(bin_dir)
+                if bin_dir not in os.environ.get("PATH", ""):
+                    os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+    except Exception as e:
+        print(f"[STT Engine] Warning: could not register cuBLAS DLL directory: {e}")
 
 
 class SpeechToTextEngine:
@@ -24,6 +53,8 @@ class SpeechToTextEngine:
             self.compute_type = "float16" if self.device == "cuda" else "int8"
         else:
             self.compute_type = compute_setting
+
+        _register_cublas_dll_directory()
 
         print(f"[STT Engine] Loading Faster-Whisper ({model_size}) on {self.device} ({self.compute_type})...")
         self.model = WhisperModel(

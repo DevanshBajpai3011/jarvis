@@ -34,6 +34,7 @@ class WakeWordListener:
         self.is_listening = False
         self.threshold = threshold if threshold is not None else getattr(config, "WAKEWORD_THRESHOLD", 0.50)
         self.model_name = model_name or getattr(config, "WAKEWORD_NAME", "hey_jarvis")
+        self.gain_scaler = getattr(config, "WAKEWORD_GAIN_SCALER", 2.0)
         self.audio_buffer = np.array([], dtype=np.int16)
         
         # Ensure openWakeWord models are available locally
@@ -121,6 +122,8 @@ class WakeWordListener:
                         if rms_callback:
                             audio_listener.monitor_mic_rms(chunk, rms_callback=rms_callback)
 
+                        # Software pre-gain scaler to compensate for low-voltage laptop mic arrays
+                        chunk = np.clip(chunk.astype(np.float32) * self.gain_scaler, -32768, 32767).astype(np.int16)
                         self.oww_model.predict(chunk)
                         score = self.oww_model.prediction_buffer[self.model_name][-1]
 

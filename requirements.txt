@@ -21,6 +21,7 @@ duckduckgo_search
 pycaw
 comtypes
 screen-brightness-control
+nvidia-cublas-cu12
 winrt-Windows.UI.Notifications
 winrt-Windows.UI.Notifications.Management
 
