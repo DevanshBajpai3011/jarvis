@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.wav
+memory/chroma_db/
+temp/
+temp_vision/
+.claude/
+
