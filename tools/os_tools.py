@@ -7,11 +7,106 @@ import screen_brightness_control as sbc
 
 logger = logging.getLogger(__name__)
 
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    HAS_NVML = True
+except Exception:
+    HAS_NVML = False
+
+try:
+    import wmi
+    import pythoncom
+    HAS_WMI = True
+except Exception:
+    HAS_WMI = False
+
 # Windows Virtual Key Codes for Volume Control
 VK_VOLUME_MUTE = 0xAD
 VK_VOLUME_DOWN = 0xAE
 VK_VOLUME_UP = 0xAF
 KEYEVENTF_KEYUP = 0x0002
+
+
+def get_power_draw_watts(cpu_pct: float = None, is_plugged: bool = None) -> tuple:
+    """
+    Computes estimated system power draw in watts. This is the single shared
+    implementation used by both ui/overlay.py's TelemetryWorker (HUD display) and
+    get_power_draw() below (LLM-callable tool), so the two surfaces can't silently
+    drift out of sync with each other.
+
+    Combines a live NVIDIA GPU wattage reading (via pynvml, when available) with
+    either a WMI battery-discharge-rate reading (when on battery) or a rough
+    CPU-load-based wattage estimate (when on AC power, since Windows exposes no
+    simple universal CPU-package-power API without vendor-specific drivers).
+
+    Args:
+        cpu_pct (float, optional): Current CPU utilization percent. Queried via psutil if omitted.
+        is_plugged (bool, optional): Whether AC power is connected. Queried via psutil if omitted.
+
+    Returns:
+        tuple[float, str, float]: (total_watts, human-readable label e.g. "45 W (AC)", gpu_watts).
+    """
+    if cpu_pct is None:
+        cpu_pct = psutil.cpu_percent(interval=0.5)
+    if is_plugged is None:
+        battery = psutil.sensors_battery()
+        is_plugged = battery.power_plugged if battery else True
+
+    gpu_watts = 0.0
+    if HAS_NVML:
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            gpu_watts = float(pynvml.nvmlDeviceGetPowerUsage(handle)) / 1000.0
+        except Exception:
+            gpu_watts = 0.0
+
+    if not is_plugged and HAS_WMI:
+        try:
+            pythoncom.CoInitialize()
+            c = wmi.WMI(namespace="root\\wmi")
+            items = c.BatteryStatus()
+            if items and len(items) > 0:
+                rate_mw = getattr(items[0], "DischargingRate", None)
+                if rate_mw and rate_mw > 0:
+                    watts = rate_mw / 1000.0
+                    return watts, f"{watts:.1f} W", gpu_watts
+        except Exception:
+            pass
+        finally:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+    cpu_watts = 10.0 + (cpu_pct / 100.0) * 35.0
+    total_watts = cpu_watts + gpu_watts
+    tag = "AC" if is_plugged else "BAT"
+    return total_watts, f"{total_watts:.0f} W ({tag})", gpu_watts
+
+
+def get_power_draw() -> str:
+    """
+    Retrieve current CPU and GPU power draw in watts.
+
+    Reports an estimated total system power draw (combining a CPU-load-based
+    estimate or battery discharge rate with a live NVIDIA GPU wattage reading),
+    the GPU's own power draw, and whether the system is running on AC or battery.
+    """
+    try:
+        total_watts, watts_label, gpu_watts = get_power_draw_watts()
+        battery = psutil.sensors_battery()
+        is_plugged = battery.power_plugged if battery else True
+
+        return (
+            f"Power Draw:\n"
+            f"- Estimated Total System Power: {watts_label}\n"
+            f"- GPU Power Draw: {gpu_watts:.1f} W\n"
+            f"- Power Source: {'Plugged In (AC)' if is_plugged else 'On Battery'}"
+        )
+    except Exception as e:
+        logger.error(f"[OSTools] Failed to retrieve power draw: {e}")
+        return f"Failed to retrieve power draw: {e}"
 
 
 def set_system_volume(level: int) -> str:
@@ -71,26 +166,31 @@ def set_display_brightness(level_percent: int) -> str:
 
 
 def get_hardware_status() -> str:
-    """Retrieve current battery level, power status, CPU usage, and RAM usage."""
+    """Retrieve current battery level, power status, CPU usage, RAM usage, and power draw."""
     try:
         cpu = psutil.cpu_percent(interval=0.5)
         ram = psutil.virtual_memory().percent
 
         battery_info = "Desktop / No Battery Detected"
         battery = psutil.sensors_battery()
+        is_plugged = True
         if battery:
+            is_plugged = battery.power_plugged
             plugged = "Plugged In" if battery.power_plugged else "On Battery"
             battery_info = f"{battery.percent}% ({plugged})"
 
         brightness = sbc.get_brightness(display=0)
         brightness_str = f"{brightness[0]}%" if brightness else "Unknown"
 
+        _, power_label, _ = get_power_draw_watts(cpu_pct=cpu, is_plugged=is_plugged)
+
         return (
             f"Hardware Status:\n"
             f"- CPU Usage: {cpu}%\n"
             f"- RAM Usage: {ram}%\n"
             f"- Display Brightness: {brightness_str}\n"
-            f"- Battery: {battery_info}"
+            f"- Battery: {battery_info}\n"
+            f"- Power Draw: {power_label}"
         )
     except Exception as e:
         logger.error(f"[OSTools] Failed to retrieve hardware metrics: {e}")

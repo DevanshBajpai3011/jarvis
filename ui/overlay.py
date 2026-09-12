@@ -16,13 +16,6 @@ try:
 except Exception:
     HAS_NVML = False
 
-try:
-    import wmi
-    import pythoncom
-    HAS_WMI = True
-except Exception:
-    HAS_WMI = False
-
 from PySide6.QtCore import Qt, Signal, Slot, QObject, QPoint, QThread, QTimer, QRectF
 from PySide6.QtGui import QColor, QPainter, QBrush, QPen, QLinearGradient, QMouseEvent, QCursor
 from PySide6.QtWidgets import (
@@ -64,36 +57,14 @@ class TelemetryWorker(QThread):
         self._last_time = time.time()
 
     def _get_power_draw(self, cpu_pct: float, is_plugged: bool) -> tuple[float, str]:
-        gpu_watts = 0.0
-        if HAS_NVML:
-            try:
-                handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-                gpu_watts = float(pynvml.nvmlDeviceGetPowerUsage(handle)) / 1000.0
-            except Exception:
-                gpu_watts = 0.0
-
-        if not is_plugged and HAS_WMI:
-            try:
-                pythoncom.CoInitialize()
-                c = wmi.WMI(namespace="root\\wmi")
-                items = c.BatteryStatus()
-                if items and len(items) > 0:
-                    rate_mw = getattr(items[0], "DischargingRate", None)
-                    if rate_mw and rate_mw > 0:
-                        watts = rate_mw / 1000.0
-                        return watts, f"{watts:.1f} W"
-            except Exception:
-                pass
-            finally:
-                try:
-                    pythoncom.CoUninitialize()
-                except Exception:
-                    pass
-
-        cpu_watts = 10.0 + (cpu_pct / 100.0) * 35.0
-        total_watts = cpu_watts + gpu_watts
-        tag = "AC" if is_plugged else "BAT"
-        return total_watts, f"{total_watts:.0f} W ({tag})"
+        """
+        Delegates to tools.os_tools.get_power_draw_watts() -- the single shared
+        implementation also used by the get_power_draw() LLM tool -- so the HUD
+        display and the tool can never silently drift out of sync with each other.
+        """
+        from tools.os_tools import get_power_draw_watts
+        total_watts, label, _gpu_watts = get_power_draw_watts(cpu_pct, is_plugged)
+        return total_watts, label
 
     def run(self):
         while self.running:

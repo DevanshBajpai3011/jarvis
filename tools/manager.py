@@ -23,6 +23,7 @@ from tools import (
     set_system_volume,
     set_display_brightness,
     get_hardware_status,
+    get_power_draw,
     shutdown_system,
     restart_system,
     sleep_system,
@@ -62,6 +63,7 @@ REGISTERED_TOOLS = [
     set_system_volume,
     set_display_brightness,
     get_hardware_status,
+    get_power_draw,
     shutdown_system,
     restart_system,
     sleep_system,
@@ -149,6 +151,11 @@ def execute_registered_tool(
         elif function_name in ("get_hardware_status", "hardware_status", "system_metrics"):
             res = get_hardware_status()
             log_action("Retrieved hardware status")
+            return res
+
+        elif function_name in ("get_power_draw", "power_draw", "get_voltage", "system_power"):
+            res = get_power_draw()
+            log_action("Retrieved power draw")
             return res
 
         elif function_name in ("shutdown_system", "shutdown"):
