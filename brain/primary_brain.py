@@ -131,6 +131,38 @@ class PrimaryBrain:
 
                     if has_yielded:
                         return
+
+                    # KNOWN ISSUE: Gemini 3.x streaming (generate_content_stream) can return a
+                    # fully empty response (finish_reason=STOP, no exception, no text, no
+                    # function_call) when `tools` is combined with `system_instruction` and/or
+                    # `response_modalities` on the same request. Confirmed via live testing
+                    # (Sept 2026) against gemini-3.6-flash; not seen on gemini-3.1-flash-lite
+                    # under the identical config. This is a known issue across Gemini 3.x with
+                    # streaming + function calling (multiple public reports), with no fix from
+                    # Google as of Sept 2026. The documented workaround is to redo the same
+                    # request non-streaming. Do NOT remove this retry as "redundant" -- without
+                    # it, this exact request shape silently falls through the entire model
+                    # fallback chain to the generic hardcoded error message. See BUGS.md.
+                    logger.warning(
+                        f"[PrimaryBrain] Model '{target_model}' streaming returned empty with "
+                        "tools active -- retrying non-streaming per known Gemini 3.x limitation."
+                    )
+                    retry_text = self._non_streaming_retry(
+                        target_model,
+                        contents,
+                        system_instruction,
+                        timed_prompt,
+                        action_callback,
+                        display_callback,
+                    )
+                    if retry_text:
+                        yield retry_text
+                        return
+
+                    logger.warning(
+                        f"[PrimaryBrain] Model '{target_model}' non-streaming retry also "
+                        "returned empty -- treating as a genuine failure, trying next model."
+                    )
                 except Exception as ex:
                     logger.warning(f"[PrimaryBrain] Model '{target_model}' stream failed: {ex}")
                     continue
@@ -143,6 +175,80 @@ class PrimaryBrain:
                     img_obj.close()
                 except Exception:
                     pass
+
+    def _non_streaming_retry(
+        self,
+        target_model: str,
+        contents,
+        system_instruction: str,
+        timed_prompt: str,
+        action_callback: Optional[Callable[[str], None]],
+        display_callback: Optional[Callable[[str, str], None]],
+    ) -> Optional[str]:
+        """
+        Non-streaming fallback for the known Gemini 3.x empty-stream bug (see stream_think).
+        Redoes the same request via generate_content() -- same model, same tools, same
+        system_instruction/context -- and runs any resulting function call through the same
+        tool-execution + follow-up synthesis pattern as brain/llm.py's Brain.think().
+
+        Returns the final response text, or None if the retry is also empty/fails.
+        """
+        try:
+            response = self.client.models.generate_content(
+                model=target_model,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    tools=JARVIS_TOOLS,
+                    response_modalities=["TEXT"],
+                ),
+            )
+        except Exception as ex:
+            logger.warning(f"[PrimaryBrain] Model '{target_model}' non-streaming retry raised: {ex}")
+            return None
+
+        function_calls = getattr(response, "function_calls", None)
+        if not function_calls and response and response.candidates:
+            for candidate in response.candidates:
+                if candidate.content and candidate.content.parts:
+                    for part in candidate.content.parts:
+                        if hasattr(part, "function_call") and part.function_call:
+                            if function_calls is None:
+                                function_calls = []
+                            function_calls.append(part.function_call)
+
+        if function_calls:
+            call = function_calls[0]
+            func_name = getattr(call, "name", "")
+            func_args = getattr(call, "args", {})
+            func_args_dict = dict(func_args) if isinstance(func_args, dict) or hasattr(func_args, "items") else {}
+
+            tool_result = execute_tool_call(
+                func_name,
+                func_args_dict,
+                action_callback=action_callback,
+                display_callback=display_callback,
+            )
+            followup_prompt = (
+                f"{timed_prompt}\n\n[Tool '{func_name}' executed. Output: \"{tool_result}\"]\n"
+                "Synthesize a concise, natural, polite spoken J.A.R.V.I.S. response."
+            )
+            try:
+                followup_response = self.client.models.generate_content(
+                    model=target_model,
+                    contents=followup_prompt,
+                    config=types.GenerateContentConfig(system_instruction=system_instruction),
+                )
+            except Exception as ex:
+                logger.warning(f"[PrimaryBrain] Model '{target_model}' non-streaming followup raised: {ex}")
+                return tool_result
+            if followup_response and followup_response.text:
+                return followup_response.text.strip()
+            return tool_result
+
+        if response and response.text:
+            return response.text.strip()
+        return None
 
 
 if __name__ == "__main__":

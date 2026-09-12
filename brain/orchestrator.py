@@ -1,6 +1,8 @@
 import os
 import re
 import logging
+import queue
+import threading
 import concurrent.futures
 from typing import Optional, Callable, Dict, Any
 
@@ -9,6 +11,7 @@ from stt import WhisperSTT
 from tts import PiperTTS, get_tts_manager, TTSManager, speech_engine, SpeechEngine
 from brain.persona import JARVIS_SYSTEM_PROMPT
 from brain.llm import Brain
+from brain.primary_brain import PrimaryBrain
 from brain.openrouter_client import OpenRouterBrain
 from brain.planner import TaskPlanner
 from brain.state import ExecutionState
@@ -16,6 +19,7 @@ from brain.agent import AutonomousAgent
 from memory import MemoryManager
 from vision import VisionCapturer
 from tools import FileParser, open_application, manage_reminder, execute_whitelisted_script
+from utils.sentence_chunker import SentenceChunker
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +68,7 @@ class Orchestrator:
         listener: Optional[WakeWordListener] = None,
         stt: Optional[WhisperSTT] = None,
         brain: Optional[Brain] = None,
+        primary_brain: Optional[PrimaryBrain] = None,
         openrouter_brain: Optional[OpenRouterBrain] = None,
         memory_manager: Optional[MemoryManager] = None,
         tts: Optional[SpeechEngine] = None,
@@ -74,7 +79,14 @@ class Orchestrator:
         logger.info("[Orchestrator] Initializing unified system orchestrator...")
         self.listener = listener or WakeWordListener()
         self.stt = stt or WhisperSTT()
+        # self.brain (non-streaming Brain) is kept separate from self.primary_brain
+        # (streaming PrimaryBrain) deliberately -- TaskPlanner and AutonomousAgent both
+        # need a synchronous, complete-string .think() (TaskPlanner even parses the
+        # result as JSON), which PrimaryBrain does not provide at all (only
+        # .stream_think()). Sharing one instance between them was considered and
+        # rejected; see CHANGELOG.md's Step 3 entry for the full blast-radius analysis.
         self.brain = brain or Brain()
+        self.primary_brain = primary_brain or PrimaryBrain()
         self.openrouter_brain = openrouter_brain or OpenRouterBrain()
         self.memory_manager = memory_manager or MemoryManager()
         self.tts = tts or speech_engine
@@ -207,31 +219,88 @@ class Orchestrator:
             except Exception as mem_err:
                 logger.warning(f"[Orchestrator] Parallel memory retrieval note: {mem_err}")
 
-        # LLM Generation & Tool Execution
-        response = self.brain.think(
-            transcript_clean,
-            context=recalled_context,
-            image_path=active_image_path,
-            action_callback=emit_action,
-            display_callback=display_callback
-        )
+        # LLM Generation & Tool Execution -- streamed: PrimaryBrain.stream_think()
+        # feeds a SentenceChunker, and each confirmed sentence is handed to TTS on a
+        # dedicated background thread the moment it's ready, while the LLM stream
+        # keeps running for the rest of the response (proven in
+        # tests/test_streaming_pipeline.py, Step 2 of the streaming-TTS rewrite).
+        update_status("SPEAKING")
+
+        chunker = SentenceChunker()
+        sentence_queue: "queue.Queue" = queue.Queue()
+
+        def _tts_worker():
+            while True:
+                item = sentence_queue.get()
+                if item is None:
+                    sentence_queue.task_done()
+                    break
+                text, is_last = item
+                try:
+                    if is_last and on_complete_callback:
+                        try:
+                            self.tts.speak(text, on_complete_callback=on_complete_callback)
+                        except TypeError:
+                            self.tts.speak(text)
+                            on_complete_callback()
+                    else:
+                        self.tts.speak(text)
+                except Exception as tts_err:
+                    logger.warning(f"[Orchestrator] TTS playback error: {tts_err}")
+                sentence_queue.task_done()
+
+        tts_thread = None
+        if self.tts:
+            tts_thread = threading.Thread(target=_tts_worker, daemon=True)
+            tts_thread.start()
+
+        # held_sentence implements a one-behind buffer: we don't know a confirmed
+        # sentence is the LAST one until either another sentence arrives after it
+        # (proving it wasn't last) or the stream ends -- this is what lets
+        # on_complete_callback attach to the correct (final) speak() call without
+        # touching the turn-completion signal logic itself (that's Step 4).
+        held_sentence = None
+        full_response_parts = []
+        try:
+            for delta in self.primary_brain.stream_think(
+                transcript_clean,
+                context=recalled_context,
+                image_path=active_image_path,
+                action_callback=emit_action,
+                display_callback=display_callback
+            ):
+                full_response_parts.append(delta)
+                if self.tts:
+                    for sentence in chunker.add_chunk(delta):
+                        if held_sentence is not None:
+                            sentence_queue.put((held_sentence, False))
+                        held_sentence = sentence
+        finally:
+            if self.tts:
+                final_remainder = chunker.flush()
+                if final_remainder:
+                    if held_sentence is not None:
+                        sentence_queue.put((held_sentence, False))
+                    held_sentence = final_remainder
+
+                if held_sentence is not None:
+                    sentence_queue.put((held_sentence, True))
+                elif on_complete_callback:
+                    # Nothing was ever produced -- don't leave the follow-up window
+                    # mechanism (or anything else waiting on this signal) hanging.
+                    try:
+                        on_complete_callback()
+                    except Exception as cb_err:
+                        logger.warning(f"[Orchestrator] on_complete_callback error: {cb_err}")
+
+                sentence_queue.put(None)
+
+        response = "".join(full_response_parts)
         emit_message("J.A.R.V.I.S.", response)
 
-        # Sentence-Level Streaming TTS Output
-        update_status("SPEAKING")
-        if self.tts:
-            if on_complete_callback:
-                try:
-                    self.tts.speak(response, on_complete_callback=on_complete_callback)
-                except TypeError:
-                    self.tts.speak(response)
-                    if on_complete_callback:
-                        on_complete_callback()
-            elif hasattr(self.tts, "speak_chunked"):
-                self.tts.speak_chunked(response)
-            else:
-                self.tts.speak(response)
-
+        if tts_thread:
+            sentence_queue.join()
+            tts_thread.join(timeout=60)
 
         # Background Cognitive Memory Extraction & Memory Store Update
         try:
