@@ -1,5 +1,7 @@
 import os
 import logging
+import threading
+import time
 from typing import Optional, Callable
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 import config
@@ -70,15 +72,83 @@ class VoiceListenerWorker(QThread):
         self.listener = listener
         self.stt = stt
         self.running = True
-        self.voice_enabled = True
+
+        # _voice_enabled, _followup_requested, and _followup_timeout are read/written from
+        # both this thread (run()) and the GUI/CommandWorker thread (via the voice_enabled
+        # property, trigger_followup_listen(), toggle_voice_listener(), etc.) -- guarded by
+        # _state_lock rather than relying on bare attribute access across threads.
+        self._state_lock = threading.Lock()
+        self._voice_enabled = True
         self._followup_requested = False
         self._followup_timeout = getattr(config, "FOLLOW_UP_LISTEN_TIMEOUT", 8)
 
+        # Set by CommandWorker's thread (via on_tts_complete) once a full turn -- memory
+        # retrieval, LLM call, and TTS playback -- has actually finished. The ambient loop
+        # waits on this instead of immediately re-entering the blocking, timeout-less
+        # listen_for_wakeword() call, which previously meant the follow-up window almost
+        # never got checked at a useful moment (see CHANGELOG.md for the full writeup).
+        self._turn_complete_event = threading.Event()
+
+    @property
+    def voice_enabled(self) -> bool:
+        with self._state_lock:
+            return self._voice_enabled
+
+    @voice_enabled.setter
+    def voice_enabled(self, value: bool) -> None:
+        with self._state_lock:
+            self._voice_enabled = value
+
     def trigger_followup_listen(self, timeout: float = 8.0):
-        """Triggers a direct mic listening timeout window without requiring wake word."""
-        if self.voice_enabled:
-            self._followup_timeout = timeout
-            self._followup_requested = True
+        """
+        Requests a direct mic listening window (no wake word needed) once the current
+        turn finishes. Called from CommandWorker's thread via on_tts_complete.
+        """
+        with self._state_lock:
+            if self._voice_enabled:
+                self._followup_timeout = timeout
+                self._followup_requested = True
+
+    def _consume_followup_request(self):
+        with self._state_lock:
+            requested = self._followup_requested
+            timeout = self._followup_timeout
+            self._followup_requested = False
+            return requested, timeout
+
+    def signal_turn_complete(self):
+        """
+        Called from CommandWorker's thread (via on_tts_complete) once a full turn has
+        actually finished, so the ambient loop -- blocked in _wait_for_turn_complete()
+        after handing off a transcript -- knows it's safe to check for a follow-up
+        request or resume normal wake-word listening.
+        """
+        self._turn_complete_event.set()
+
+    def _wait_for_turn_complete(self, max_wait: float = 60.0, grace: float = 1.0) -> None:
+        """
+        Blocks until CommandWorker signals the current turn is fully done, instead of
+        immediately looping back into the blocking, timeout-less listen_for_wakeword()
+        call. max_wait is a safety net in case something goes wrong downstream and
+        signal_turn_complete() never fires (e.g. an exception before on_tts_complete
+        runs) -- without it this thread would otherwise hang here forever. Once the
+        event fires, _followup_requested is given a brief grace window to become visible
+        before returning control to run(), which re-checks it at the top of the loop.
+        """
+        fired = self._turn_complete_event.wait(timeout=max_wait)
+        if not fired:
+            logger.warning(
+                f"[Turn-Taking] Turn-complete signal not received within {max_wait}s "
+                "safety-net timeout; resuming ambient listening anyway."
+            )
+            return
+
+        grace_deadline = time.time() + grace
+        while time.time() < grace_deadline:
+            with self._state_lock:
+                if self._followup_requested:
+                    return
+            time.sleep(0.05)
 
     def run(self):
         while self.running:
@@ -87,9 +157,9 @@ class VoiceListenerWorker(QThread):
                 continue
 
             # 1. Handle Post-Reply Follow-Up Turn-Taking Window
-            if self._followup_requested:
-                self._followup_requested = False
-                timeout = self._followup_timeout
+            followup_requested, followup_timeout = self._consume_followup_request()
+            if followup_requested:
+                timeout = followup_timeout
                 logger.info(f"[Turn-Taking] Opening {timeout}s direct mic listening window...")
                 try:
                     self.status_changed.emit("LISTENING (FOLLOW-UP)")
@@ -103,7 +173,9 @@ class VoiceListenerWorker(QThread):
                         transcript = self.stt.transcribe(wav_path)
                         if transcript and transcript.strip():
                             logger.info(f"[Turn-Taking] Follow-up utterance captured: '{transcript.strip()}'")
+                            self._turn_complete_event.clear()
                             self.speech_detected.emit(transcript.strip())
+                            self._wait_for_turn_complete()
                         else:
                             logger.info(f"[Turn-Taking] {timeout}s window completed without speech. Returning to standby.")
                             self.status_changed.emit("STANDBY")
@@ -132,13 +204,16 @@ class VoiceListenerWorker(QThread):
                     self.status_changed.emit("THINKING")
                     transcript = self.stt.transcribe(wav_path)
                     if transcript and transcript.strip():
+                        self._turn_complete_event.clear()
                         self.speech_detected.emit(transcript.strip())
+                        self._wait_for_turn_complete()
             except Exception as e:
                 logger.error(f"[VoiceListenerWorker Error] {e}")
                 self.msleep(1000)
 
     def stop(self):
         self.running = False
+        self._turn_complete_event.set()
         self.wait(1000)
 
 
@@ -245,6 +320,11 @@ class SystemBridge(QObject):
                 timeout = getattr(config, "FOLLOW_UP_LISTEN_TIMEOUT", 8)
                 logger.info(f"[Turn-Taking] TTS speech output completed cleanly. Triggering {timeout}s post-reply follow-up mic window.")
                 self.voice_worker.trigger_followup_listen(timeout=timeout)
+            # Always signal turn completion, regardless of whether follow-up mode applies,
+            # so the ambient listener thread (blocked in _wait_for_turn_complete()) knows
+            # it's safe to resume -- either into the follow-up window above, or back into
+            # normal wake-word listening.
+            self.voice_worker.signal_turn_complete()
 
         self.current_cmd_worker = CommandWorker(
             user_input=user_input,

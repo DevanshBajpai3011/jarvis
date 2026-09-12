@@ -46,6 +46,8 @@ class CognitiveMemoryExtractor:
             f"User: '{user_input.strip()}'\n"
             f"Assistant: '{assistant_response.strip()}'\n\n"
             f"Does this turn contain permanent personal details, user preferences, active project updates, or relationships?\n"
+            f"Only extract facts explicitly stated by the User. Never extract information from the "
+            f"Assistant's own response, apologies, or error messages as if they were facts about the user.\n"
             f"Reply strictly YES or NO."
         )
 
@@ -71,6 +73,8 @@ class CognitiveMemoryExtractor:
             f'{{"category": "identity|preferences|projects|relationships", "fact": "Extracted core fact string"}}\n\n'
             f"User: '{user_input.strip()}'\n"
             f"Assistant: '{assistant_response.strip()}'\n\n"
+            f"Only extract facts explicitly stated by the User. Never extract information from the "
+            f"Assistant's own response, apologies, or error messages as if they were facts about the user.\n"
             f"Reply ONLY with the raw valid JSON object."
         )
 
