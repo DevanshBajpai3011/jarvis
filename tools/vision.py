@@ -60,7 +60,7 @@ def analyze_screen(prompt: str = "Describe what is currently visible on my scree
         screenshot = _grab_screen_image()
         
         # Load multimodal Gemini Flash model
-        model = genai.GenerativeModel("gemini-2.0-flash")
+        model = genai.GenerativeModel("gemini-3.6-flash")
         
         response = model.generate_content([
             prompt,

@@ -23,7 +23,7 @@ class Brain:
             model_name (str, optional): Model identifier override.
         """
         self.api_key = api_key or getattr(config, "GEMINI_API_KEY", "")
-        self.model_name = model_name or getattr(config, "DEFAULT_MODEL", "gemini-2.0-flash")
+        self.model_name = model_name or getattr(config, "DEFAULT_MODEL", "gemini-3.6-flash")
 
         self.client = None
         if self.api_key and self.api_key != "your_gemini_api_key_here":
@@ -95,7 +95,7 @@ class Brain:
             contents = timed_prompt
 
         models_to_try = [self.model_name]
-        for fallback in ["gemini-flash-latest", "gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-3.6-flash", "gemini-3.1-flash-lite"]:
+        for fallback in ["gemini-flash-latest", "gemini-3.1-flash-lite", "gemini-2.0-flash-lite", "gemini-3.6-flash"]:
             if fallback not in models_to_try:
                 models_to_try.append(fallback)
 

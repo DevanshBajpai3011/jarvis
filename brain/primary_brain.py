@@ -21,7 +21,7 @@ class PrimaryBrain:
 
     def __init__(self, api_key: str = None, model_name: str = None):
         self.api_key = api_key or getattr(config, "GEMINI_API_KEY", "")
-        self.model_name = model_name or getattr(config, "PRIMARY_MODEL", "gemini-2.5-flash")
+        self.model_name = model_name or getattr(config, "PRIMARY_MODEL", "gemini-3.6-flash")
 
         self.client = None
         if self.api_key and self.api_key != "your_gemini_api_key_here":
@@ -83,7 +83,7 @@ class PrimaryBrain:
 
         contents = [img_obj, timed_prompt] if img_obj is not None else timed_prompt
 
-        models_to_try = [self.model_name, "gemini-2.0-flash", "gemini-flash-latest", "gemini-2.0-flash-lite"]
+        models_to_try = [self.model_name, "gemini-3.1-flash-lite", "gemini-flash-latest", "gemini-2.0-flash-lite"]
 
         try:
             for target_model in models_to_try:

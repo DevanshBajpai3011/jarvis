@@ -7,7 +7,7 @@ except ImportError:
     pass
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gemini-2.0-flash")
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gemini-3.6-flash")
 PIPER_VOICE_MODEL = os.getenv("PIPER_VOICE_MODEL", "en_GB-alan-medium")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free")
@@ -53,7 +53,7 @@ OPENCLAW_API_KEY = ""
 ENABLE_OPENCLAW_GATEWAY = True
 
 # Dual-Brain Architecture parameters
-PRIMARY_MODEL = os.getenv("PRIMARY_MODEL", "gemini-2.5-flash")
+PRIMARY_MODEL = os.getenv("PRIMARY_MODEL", "gemini-3.6-flash")
 ENABLE_DUAL_BRAIN = os.getenv("ENABLE_DUAL_BRAIN", "true").lower() == "true"
 
 # Two-Stage Cognitive Memory parameters
