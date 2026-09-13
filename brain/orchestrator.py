@@ -229,24 +229,25 @@ class Orchestrator:
         chunker = SentenceChunker()
         sentence_queue: "queue.Queue" = queue.Queue()
 
+        # turn_state["clean"] tracks whether the most recently *processed* sentence
+        # played back without barge-in interruption -- mutated only by _tts_worker,
+        # read only by the main thread after tts_thread.join() below (join() gives
+        # a happens-before guarantee, so no lock is needed for this handoff).
+        # Replaces the old per-call on_complete_callback injection: SpeechEngine.speak()
+        # now returns True/False instead (Step 4 redesign, see CHANGELOG.md).
+        turn_state = {"clean": True}
+
         def _tts_worker():
             while True:
                 item = sentence_queue.get()
                 if item is None:
                     sentence_queue.task_done()
                     break
-                text, is_last = item
                 try:
-                    if is_last and on_complete_callback:
-                        try:
-                            self.tts.speak(text, on_complete_callback=on_complete_callback)
-                        except TypeError:
-                            self.tts.speak(text)
-                            on_complete_callback()
-                    else:
-                        self.tts.speak(text)
+                    turn_state["clean"] = bool(self.tts.speak(item))
                 except Exception as tts_err:
                     logger.warning(f"[Orchestrator] TTS playback error: {tts_err}")
+                    turn_state["clean"] = False
                 sentence_queue.task_done()
 
         tts_thread = None
@@ -254,13 +255,20 @@ class Orchestrator:
             tts_thread = threading.Thread(target=_tts_worker, daemon=True)
             tts_thread.start()
 
-        # held_sentence implements a one-behind buffer: we don't know a confirmed
-        # sentence is the LAST one until either another sentence arrives after it
-        # (proving it wasn't last) or the stream ends -- this is what lets
-        # on_complete_callback attach to the correct (final) speak() call without
-        # touching the turn-completion signal logic itself (that's Step 4).
-        held_sentence = None
+        # Step 4 turn-completion redesign: sentences are queued directly, in order,
+        # with no attempt to guess which one is "last" up front. The old one-behind
+        # buffer (held_sentence) inferred that from stream_think() generator timing
+        # alone -- an implicit, unenforced invariant that only happened to hold
+        # because Bug #16's tool-call loop lives entirely inside stream_think()'s own
+        # generator. Nothing protected against that assumption breaking later, and a
+        # real gap existed on the exception path (see CHANGELOG.md's Step 4 entry for
+        # the full diagnosis). Replaced rather than patched: the orchestration layer
+        # now explicitly waits for BOTH (a) this generator to fully exhaust -- every
+        # tool-call round included, whether it finishes normally or raises -- AND
+        # (b) every queued sentence to actually finish TTS playback (the joins below),
+        # before ever deciding to signal turn completion.
         full_response_parts = []
+        generation_error = None
         try:
             for delta in self.primary_brain.stream_think(
                 transcript_clean,
@@ -272,35 +280,41 @@ class Orchestrator:
                 full_response_parts.append(delta)
                 if self.tts:
                     for sentence in chunker.add_chunk(delta):
-                        if held_sentence is not None:
-                            sentence_queue.put((held_sentence, False))
-                        held_sentence = sentence
+                        sentence_queue.put(sentence)
+        except Exception as gen_err:
+            generation_error = gen_err
+            logger.error(f"[Orchestrator] stream_think() generation failed mid-turn: {gen_err}")
         finally:
             if self.tts:
                 final_remainder = chunker.flush()
                 if final_remainder:
-                    if held_sentence is not None:
-                        sentence_queue.put((held_sentence, False))
-                    held_sentence = final_remainder
-
-                if held_sentence is not None:
-                    sentence_queue.put((held_sentence, True))
-                elif on_complete_callback:
-                    # Nothing was ever produced -- don't leave the follow-up window
-                    # mechanism (or anything else waiting on this signal) hanging.
-                    try:
-                        on_complete_callback()
-                    except Exception as cb_err:
-                        logger.warning(f"[Orchestrator] on_complete_callback error: {cb_err}")
-
+                    sentence_queue.put(final_remainder)
                 sentence_queue.put(None)
 
         response = "".join(full_response_parts)
         emit_message("J.A.R.V.I.S.", response)
 
+        # Unconditional join: the orchestration layer's own proof that every queued
+        # sentence -- whichever one actually turned out to be last -- has finished
+        # real audio playback, regardless of whether generation above succeeded or
+        # raised. Only past this point is it truthful to signal turn completion.
         if tts_thread:
             sentence_queue.join()
             tts_thread.join(timeout=60)
+
+        if on_complete_callback and turn_state["clean"]:
+            try:
+                on_complete_callback()
+            except Exception as cb_err:
+                logger.warning(f"[Orchestrator] on_complete_callback error: {cb_err}")
+
+        if generation_error:
+            # Re-raise only after the completion signal has fired and all queued
+            # audio has actually finished playing -- CommandWorker's existing
+            # generic error handling (spoken fallback message, STANDBY status)
+            # still applies unchanged from here, per the original exception-path
+            # behavior; only the ordering relative to TTS completion changed.
+            raise generation_error
 
         # Background Cognitive Memory Extraction & Memory Store Update
         try:

@@ -18,16 +18,26 @@ class SpeechEngine:
         self.interrupt_event: threading.Event = threading.Event()
         self._lock = threading.Lock()
 
-    def speak(self, text: str, on_complete_callback: Optional[Callable[[], None]] = None) -> None:
+    def speak(self, text: str, on_complete_callback: Optional[Callable[[], None]] = None) -> bool:
         """
-        Synthesizes and plays speech text with interrupt event monitoring and completion callback.
+        Synthesizes and plays speech text with interrupt event monitoring.
 
         Args:
             text (str): Speech text to synthesize and speak.
-            on_complete_callback (Callable, optional): Invoked upon clean, non-interrupted completion.
+            on_complete_callback (Callable, optional): Deprecated -- kept only for backward
+                compatibility with any external caller still passing it (none in this
+                codebase as of the Step 4 turn-completion redesign; see CHANGELOG.md).
+                Orchestrator.process_input() no longer relies on this -- it tracks
+                completion itself via this method's return value instead, since a per-call
+                injected callback can't express "wait until the true last call in a
+                variable-length sequence finishes."
+
+        Returns:
+            bool: True if speech completed cleanly (not interrupted by barge-in), False
+                if it was interrupted or text was empty/whitespace.
         """
         if not text or not text.strip():
-            return
+            return False
 
         with self._lock:
             self.interrupt_event.clear()
@@ -60,6 +70,8 @@ class SpeechEngine:
                         on_complete_callback()
                     except Exception as cb_err:
                         logger.error(f"[SpeechEngine Callback Error] {cb_err}")
+
+        return not was_interrupted
 
     def stop(self) -> None:
         """
