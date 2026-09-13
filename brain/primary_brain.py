@@ -76,6 +76,11 @@ class PrimaryBrain:
             system_instruction=system_instruction,
             tools=JARVIS_TOOLS,
             response_modalities=["TEXT"],
+            # AFC bypasses execute_tool_call()/execute_registered_tool(), which is
+            # where action_callback/display_callback UI side-effects actually fire
+            # (display_content() itself is a no-op stub). Disabling AFC restores
+            # this codebase's own manual dispatch as the real execution path.
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
 
         now_str = datetime.now().strftime("%A, %B %d, %Y at %I:%M:%S %p")
@@ -201,6 +206,7 @@ class PrimaryBrain:
                     system_instruction=system_instruction,
                     tools=JARVIS_TOOLS,
                     response_modalities=["TEXT"],
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                 ),
             )
         except Exception as ex:
