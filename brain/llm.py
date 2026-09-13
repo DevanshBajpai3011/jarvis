@@ -8,6 +8,17 @@ from brain.persona import JARVIS_SYSTEM_PROMPT, build_system_prompt
 from brain.tools import JARVIS_TOOLS, execute_tool_call
 from PIL import Image
 
+# Caps chained tool calls within a single turn (mirrors google-genai AFC's own
+# default `maximum_remote_calls`). Manual dispatch needs its own cap now that
+# AFC is disabled (BUGS.md Bug #15) -- without one, a model stuck requesting
+# tools forever would loop indefinitely.
+MAX_TOOL_ITERATIONS = 10
+
+CHAIN_CAPPED_MSG = (
+    "I attempted that, sir, but it required more steps than I could safely "
+    "complete in one go. I wasn't able to finish it."
+)
+
 
 class Brain:
     """
@@ -108,54 +119,69 @@ class Brain:
         try:
             for target_model in models_to_try:
                 try:
-                    response = self.client.models.generate_content(
-                        model=target_model,
-                        contents=contents,
-                        config=config_obj,
-                    )
+                    next_contents = contents
+                    tool_history = []
+                    chain_capped = False
 
-                    function_calls = getattr(response, "function_calls", None)
-                    if not function_calls and response and response.candidates:
-                        for candidate in response.candidates:
-                            if candidate.content and candidate.content.parts:
-                                for part in candidate.content.parts:
-                                    if hasattr(part, "function_call") and part.function_call:
-                                        if function_calls is None:
-                                            function_calls = []
-                                        function_calls.append(part.function_call)
+                    for iteration in range(MAX_TOOL_ITERATIONS):
+                        response = self.client.models.generate_content(
+                            model=target_model,
+                            contents=next_contents,
+                            config=config_obj if iteration == 0 else types.GenerateContentConfig(
+                                system_instruction=system_instruction,
+                                tools=JARVIS_TOOLS,
+                                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                            ),
+                        )
 
-                    if function_calls:
-                        for call in function_calls:
-                            func_name = getattr(call, "name", "")
-                            func_args = getattr(call, "args", {})
-                            if isinstance(func_args, dict) or hasattr(func_args, "items"):
-                                func_args_dict = dict(func_args)
-                            else:
-                                func_args_dict = {}
+                        function_calls = getattr(response, "function_calls", None)
+                        if not function_calls and response and response.candidates:
+                            for candidate in response.candidates:
+                                if candidate.content and candidate.content.parts:
+                                    for part in candidate.content.parts:
+                                        if hasattr(part, "function_call") and part.function_call:
+                                            if function_calls is None:
+                                                function_calls = []
+                                            function_calls.append(part.function_call)
 
-                            tool_result = execute_tool_call(
-                                func_name,
-                                func_args_dict,
-                                action_callback=action_callback,
-                                display_callback=display_callback,
-                            )
+                        if not function_calls:
+                            if response and response.text:
+                                return response.text.strip()
+                            break
 
-                            followup_prompt = (
-                                f"{timed_prompt}\n\n"
-                                f"[System Note: Tool '{func_name}' was executed. Output: \"{tool_result}\"]\n"
-                                f"Synthesize a concise, natural, polite spoken J.A.R.V.I.S. response."
-                            )
-                            followup_response = self.client.models.generate_content(
-                                model=target_model,
-                                contents=followup_prompt,
-                                config=types.GenerateContentConfig(system_instruction=system_instruction)
-                            )
-                            if followup_response and followup_response.text:
-                                return followup_response.text.strip()
-                            return tool_result
+                        call = function_calls[0]
+                        func_name = getattr(call, "name", "")
+                        func_args = getattr(call, "args", {})
+                        if isinstance(func_args, dict) or hasattr(func_args, "items"):
+                            func_args_dict = dict(func_args)
+                        else:
+                            func_args_dict = {}
 
-                    if response and response.text:
-                        return response.text.strip()
+                        tool_result = execute_tool_call(
+                            func_name,
+                            func_args_dict,
+                            action_callback=action_callback,
+                            display_callback=display_callback,
+                        )
+                        tool_history.append(f"[System Note: Tool '{func_name}' was executed. Output: \"{tool_result}\"]")
+                        next_contents = (
+                            f"{timed_prompt}\n\n" + "\n\n".join(tool_history) +
+                            "\n\nIf this fully answers the request, synthesize a concise, "
+                            "natural, polite spoken J.A.R.V.I.S. response now -- never claim "
+                            "an action succeeded if the tool output above shows it did not. "
+                            "If another tool call is genuinely still needed to finish the "
+                            "request, call it."
+                        )
+                    else:
+                        chain_capped = True
+
+                    if chain_capped:
+                        print(
+                            f"[Brain Warning] Model '{target_model}' requested more than "
+                            f"{MAX_TOOL_ITERATIONS} chained tool calls in one turn -- "
+                            "stopping and reporting honestly instead of guessing at completion."
+                        )
+                        return CHAIN_CAPPED_MSG
 
                 except (errors.APIError, Exception) as e:
                     collected_errors.append(f"{target_model}: {e}")

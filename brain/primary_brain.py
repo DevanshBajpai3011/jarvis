@@ -12,6 +12,17 @@ from brain.tools import JARVIS_TOOLS, execute_tool_call
 
 logger = logging.getLogger(__name__)
 
+# Caps chained tool calls within a single turn (mirrors google-genai AFC's own
+# default `maximum_remote_calls`). Manual dispatch needs its own cap now that
+# AFC is disabled (BUGS.md Bug #15) -- without one, a model stuck requesting
+# tools forever would loop indefinitely.
+MAX_TOOL_ITERATIONS = 10
+
+CHAIN_CAPPED_MSG = (
+    "I attempted that, sir, but it required more steps than I could safely "
+    "complete in one go. I wasn't able to finish it."
+)
+
 
 class PrimaryBrain:
     """
@@ -93,46 +104,80 @@ class PrimaryBrain:
         try:
             for target_model in models_to_try:
                 try:
-                    response_stream = self.client.models.generate_content_stream(
-                        model=target_model,
-                        contents=contents,
-                        config=config_obj,
-                    )
-
+                    tool_history = []
+                    next_contents = contents
+                    next_config = config_obj
+                    retry_contents = contents
                     has_yielded = False
-                    for chunk in response_stream:
-                        # Check function calls
-                        function_calls = getattr(chunk, "function_calls", None)
-                        if function_calls:
-                            for call in function_calls:
-                                func_name = getattr(call, "name", "")
-                                func_args = dict(getattr(call, "args", {}))
-                                tool_result = execute_tool_call(
-                                    func_name,
-                                    func_args,
-                                    action_callback=action_callback,
-                                    display_callback=display_callback,
-                                )
-                                followup_prompt = (
-                                    f"{timed_prompt}\n\n[Tool '{func_name}' executed. Output: \"{tool_result}\"]\n"
-                                    "Synthesize a concise, natural, polite spoken J.A.R.V.I.S. response."
-                                )
-                                followup_stream = self.client.models.generate_content_stream(
-                                    model=target_model,
-                                    contents=followup_prompt,
-                                    config=types.GenerateContentConfig(
-                                        system_instruction=system_instruction,
-                                        response_modalities=["TEXT"],
-                                    ),
-                                )
-                                for f_chunk in followup_stream:
-                                    if f_chunk and f_chunk.text:
-                                        yield f_chunk.text
-                                return
+                    chain_capped = False
 
-                        if chunk and chunk.text:
-                            has_yielded = True
-                            yield chunk.text
+                    for iteration in range(MAX_TOOL_ITERATIONS):
+                        response_stream = self.client.models.generate_content_stream(
+                            model=target_model,
+                            contents=next_contents,
+                            config=next_config,
+                        )
+
+                        function_call_this_round = None
+                        has_yielded_this_round = False
+                        for chunk in response_stream:
+                            function_calls = getattr(chunk, "function_calls", None)
+                            if function_calls:
+                                function_call_this_round = function_calls[0]
+                                break
+
+                            if chunk and chunk.text:
+                                has_yielded_this_round = True
+                                has_yielded = True
+                                yield chunk.text
+
+                        if function_call_this_round is None:
+                            if has_yielded_this_round:
+                                return
+                            # Genuinely empty this round -- fall through to the
+                            # known-bug retry logic below (unchanged), using
+                            # whatever contents/config were active this round.
+                            # NOTE: local retry_* names only, deliberately not
+                            # reassigning the outer contents/config_obj -- those
+                            # must stay untouched for the next model in
+                            # models_to_try, which needs the ORIGINAL request.
+                            retry_contents = next_contents
+                            break
+
+                        func_name = getattr(function_call_this_round, "name", "")
+                        func_args = dict(getattr(function_call_this_round, "args", {}))
+                        tool_result = execute_tool_call(
+                            func_name,
+                            func_args,
+                            action_callback=action_callback,
+                            display_callback=display_callback,
+                        )
+                        tool_history.append(f"[Tool '{func_name}' executed. Output: \"{tool_result}\"]")
+                        next_contents = (
+                            f"{timed_prompt}\n\n" + "\n\n".join(tool_history) +
+                            "\n\nIf this fully answers the request, synthesize a concise, "
+                            "natural, polite spoken J.A.R.V.I.S. response now -- never claim "
+                            "an action succeeded if the tool output above shows it did not. "
+                            "If another tool call is genuinely still needed to finish the "
+                            "request, call it."
+                        )
+                        next_config = types.GenerateContentConfig(
+                            system_instruction=system_instruction,
+                            tools=JARVIS_TOOLS,
+                            response_modalities=["TEXT"],
+                            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                        )
+                    else:
+                        chain_capped = True
+
+                    if chain_capped:
+                        logger.warning(
+                            f"[PrimaryBrain] Model '{target_model}' requested more than "
+                            f"{MAX_TOOL_ITERATIONS} chained tool calls in one turn -- "
+                            "stopping and reporting honestly instead of guessing at completion."
+                        )
+                        yield CHAIN_CAPPED_MSG
+                        return
 
                     if has_yielded:
                         return
@@ -154,7 +199,7 @@ class PrimaryBrain:
                     )
                     retry_text = self._non_streaming_retry(
                         target_model,
-                        contents,
+                        retry_contents,
                         system_instruction,
                         timed_prompt,
                         action_callback,
@@ -196,34 +241,47 @@ class PrimaryBrain:
         system_instruction/context -- and runs any resulting function call through the same
         tool-execution + follow-up synthesis pattern as brain/llm.py's Brain.think().
 
+        Supports chained tool calls (capped at MAX_TOOL_ITERATIONS, mirroring the
+        streaming path and google-genai AFC's own default budget) -- if the model
+        requests another tool after seeing the first tool's result, it is executed
+        too, and so on, before a final answer is returned.
+
         Returns the final response text, or None if the retry is also empty/fails.
         """
-        try:
-            response = self.client.models.generate_content(
-                model=target_model,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    tools=JARVIS_TOOLS,
-                    response_modalities=["TEXT"],
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-                ),
-            )
-        except Exception as ex:
-            logger.warning(f"[PrimaryBrain] Model '{target_model}' non-streaming retry raised: {ex}")
-            return None
+        tool_history = []
+        next_contents = contents
 
-        function_calls = getattr(response, "function_calls", None)
-        if not function_calls and response and response.candidates:
-            for candidate in response.candidates:
-                if candidate.content and candidate.content.parts:
-                    for part in candidate.content.parts:
-                        if hasattr(part, "function_call") and part.function_call:
-                            if function_calls is None:
-                                function_calls = []
-                            function_calls.append(part.function_call)
+        for iteration in range(MAX_TOOL_ITERATIONS):
+            try:
+                response = self.client.models.generate_content(
+                    model=target_model,
+                    contents=next_contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system_instruction,
+                        tools=JARVIS_TOOLS,
+                        response_modalities=["TEXT"],
+                        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                    ),
+                )
+            except Exception as ex:
+                logger.warning(f"[PrimaryBrain] Model '{target_model}' non-streaming retry raised: {ex}")
+                return None
 
-        if function_calls:
+            function_calls = getattr(response, "function_calls", None)
+            if not function_calls and response and response.candidates:
+                for candidate in response.candidates:
+                    if candidate.content and candidate.content.parts:
+                        for part in candidate.content.parts:
+                            if hasattr(part, "function_call") and part.function_call:
+                                if function_calls is None:
+                                    function_calls = []
+                                function_calls.append(part.function_call)
+
+            if not function_calls:
+                if response and response.text:
+                    return response.text.strip()
+                return None
+
             call = function_calls[0]
             func_name = getattr(call, "name", "")
             func_args = getattr(call, "args", {})
@@ -235,26 +293,22 @@ class PrimaryBrain:
                 action_callback=action_callback,
                 display_callback=display_callback,
             )
-            followup_prompt = (
-                f"{timed_prompt}\n\n[Tool '{func_name}' executed. Output: \"{tool_result}\"]\n"
-                "Synthesize a concise, natural, polite spoken J.A.R.V.I.S. response."
+            tool_history.append(f"[Tool '{func_name}' executed. Output: \"{tool_result}\"]")
+            next_contents = (
+                f"{timed_prompt}\n\n" + "\n\n".join(tool_history) +
+                "\n\nIf this fully answers the request, synthesize a concise, "
+                "natural, polite spoken J.A.R.V.I.S. response now -- never claim "
+                "an action succeeded if the tool output above shows it did not. "
+                "If another tool call is genuinely still needed to finish the "
+                "request, call it."
             )
-            try:
-                followup_response = self.client.models.generate_content(
-                    model=target_model,
-                    contents=followup_prompt,
-                    config=types.GenerateContentConfig(system_instruction=system_instruction),
-                )
-            except Exception as ex:
-                logger.warning(f"[PrimaryBrain] Model '{target_model}' non-streaming followup raised: {ex}")
-                return tool_result
-            if followup_response and followup_response.text:
-                return followup_response.text.strip()
-            return tool_result
 
-        if response and response.text:
-            return response.text.strip()
-        return None
+        logger.warning(
+            f"[PrimaryBrain] Model '{target_model}' (non-streaming retry) requested "
+            f"more than {MAX_TOOL_ITERATIONS} chained tool calls in one turn -- "
+            "stopping and reporting honestly instead of guessing at completion."
+        )
+        return CHAIN_CAPPED_MSG
 
 
 if __name__ == "__main__":
