@@ -1,7 +1,8 @@
 import os
+import json
 import logging
 from datetime import datetime
-from typing import Optional, Callable, Generator
+from typing import Optional, Callable, Generator, Dict, List
 from PIL import Image
 
 import config
@@ -22,6 +23,79 @@ CHAIN_CAPPED_MSG = (
     "I attempted that, sir, but it required more steps than I could safely "
     "complete in one go. I wasn't able to finish it."
 )
+
+
+def _tool_call_signature(func_name: str, func_args: dict) -> str:
+    """
+    Canonical, argument-order-independent identity for a tool call, used for
+    exact-match dedup against calls already executed this turn (BUGS.md Bug #17).
+    Two calls only collide if both the name AND every argument value match --
+    a genuinely different second call to the same tool (e.g. a second reminder
+    with different text) gets its own signature and executes normally.
+    """
+    try:
+        args_json = json.dumps(func_args, sort_keys=True, default=str)
+    except Exception:
+        args_json = str(sorted(func_args.items()))
+    return f"{func_name}::{args_json}"
+
+
+def _execute_tool_with_dedup(
+    func_name: str,
+    func_args: dict,
+    tool_history: List[str],
+    executed_calls: Dict[str, str],
+    action_callback: Optional[Callable[[str], None]],
+    display_callback: Optional[Callable[[str, str], None]],
+) -> str:
+    """
+    Executes a tool call while tracking it in turn-level tool_history/executed_calls
+    (BUGS.md Bug #17). tool_history lets a model-fallback transition see what
+    already ran this turn instead of starting blind; executed_calls catches an
+    exact replay (same name, same arguments) of a call already made this turn and
+    reuses its result instead of re-running it -- skipping action_callback/
+    display_callback too, so UI narration doesn't double-fire either.
+    """
+    signature = _tool_call_signature(func_name, func_args)
+    if signature in executed_calls:
+        tool_result = executed_calls[signature]
+        logger.info(
+            f"[PrimaryBrain] Skipping re-execution of '{func_name}' -- exact same "
+            "arguments already executed earlier this turn; reusing that result."
+        )
+        tool_history.append(
+            f"[Tool '{func_name}' was already executed earlier this turn with "
+            f"these exact arguments -- reusing that result instead of running it "
+            f"again. Output: \"{tool_result}\"]"
+        )
+        return tool_result
+
+    tool_result = execute_tool_call(
+        func_name,
+        func_args,
+        action_callback=action_callback,
+        display_callback=display_callback,
+    )
+    executed_calls[signature] = tool_result
+    tool_history.append(f"[Tool '{func_name}' executed. Output: \"{tool_result}\"]")
+    return tool_result
+
+
+def _build_contents_with_history(timed_prompt: str, tool_history: List[str]) -> str:
+    """
+    Builds the follow-up prompt from everything executed so far this turn.
+    Shared by stream_think() and _non_streaming_retry() so a model-fallback
+    transition mid-turn (BUGS.md Bug #17) sees the same accumulated context
+    regardless of which path produced it.
+    """
+    return (
+        f"{timed_prompt}\n\n" + "\n\n".join(tool_history) +
+        "\n\nIf this fully answers the request, synthesize a concise, "
+        "natural, polite spoken J.A.R.V.I.S. response now -- never claim "
+        "an action succeeded if the tool output above shows it did not. "
+        "If another tool call is genuinely still needed to finish the "
+        "request, call it."
+    )
 
 
 class PrimaryBrain:
@@ -101,13 +175,19 @@ class PrimaryBrain:
 
         models_to_try = [self.model_name, "gemini-3.1-flash-lite", "gemini-flash-latest", "gemini-2.0-flash-lite"]
 
+        # Turn-level (not per-model) so a model-fallback transition doesn't lose
+        # track of tools already executed under a previous, abandoned model
+        # attempt in this same turn (BUGS.md Bug #17). executed_calls additionally
+        # catches an exact replay (same name + same arguments) and skips
+        # re-execution entirely rather than just informing the next model about it.
+        tool_history: List[str] = []
+        executed_calls: Dict[str, str] = {}
+
         try:
             for target_model in models_to_try:
                 try:
-                    tool_history = []
-                    next_contents = contents
+                    next_contents = contents if not tool_history else _build_contents_with_history(timed_prompt, tool_history)
                     next_config = config_obj
-                    retry_contents = contents
                     has_yielded = False
                     chain_capped = False
 
@@ -135,32 +215,23 @@ class PrimaryBrain:
                             if has_yielded_this_round:
                                 return
                             # Genuinely empty this round -- fall through to the
-                            # known-bug retry logic below (unchanged), using
-                            # whatever contents/config were active this round.
-                            # NOTE: local retry_* names only, deliberately not
-                            # reassigning the outer contents/config_obj -- those
-                            # must stay untouched for the next model in
-                            # models_to_try, which needs the ORIGINAL request.
-                            retry_contents = next_contents
+                            # known-bug retry logic below (unchanged). next_contents
+                            # already reflects tool_history as of just before this
+                            # round, so the non-streaming retry sees the identical
+                            # request, including anything executed earlier this turn.
                             break
 
                         func_name = getattr(function_call_this_round, "name", "")
                         func_args = dict(getattr(function_call_this_round, "args", {}))
-                        tool_result = execute_tool_call(
+                        _execute_tool_with_dedup(
                             func_name,
                             func_args,
-                            action_callback=action_callback,
-                            display_callback=display_callback,
+                            tool_history,
+                            executed_calls,
+                            action_callback,
+                            display_callback,
                         )
-                        tool_history.append(f"[Tool '{func_name}' executed. Output: \"{tool_result}\"]")
-                        next_contents = (
-                            f"{timed_prompt}\n\n" + "\n\n".join(tool_history) +
-                            "\n\nIf this fully answers the request, synthesize a concise, "
-                            "natural, polite spoken J.A.R.V.I.S. response now -- never claim "
-                            "an action succeeded if the tool output above shows it did not. "
-                            "If another tool call is genuinely still needed to finish the "
-                            "request, call it."
-                        )
+                        next_contents = _build_contents_with_history(timed_prompt, tool_history)
                         next_config = types.GenerateContentConfig(
                             system_instruction=system_instruction,
                             tools=JARVIS_TOOLS,
@@ -199,11 +270,13 @@ class PrimaryBrain:
                     )
                     retry_text = self._non_streaming_retry(
                         target_model,
-                        retry_contents,
+                        next_contents,
                         system_instruction,
                         timed_prompt,
                         action_callback,
                         display_callback,
+                        tool_history,
+                        executed_calls,
                     )
                     if retry_text:
                         yield retry_text
@@ -234,6 +307,8 @@ class PrimaryBrain:
         timed_prompt: str,
         action_callback: Optional[Callable[[str], None]],
         display_callback: Optional[Callable[[str, str], None]],
+        tool_history: List[str],
+        executed_calls: Dict[str, str],
     ) -> Optional[str]:
         """
         Non-streaming fallback for the known Gemini 3.x empty-stream bug (see stream_think).
@@ -246,9 +321,16 @@ class PrimaryBrain:
         requests another tool after seeing the first tool's result, it is executed
         too, and so on, before a final answer is returned.
 
+        tool_history/executed_calls are the SAME turn-level objects stream_think()
+        uses -- passed by reference and mutated in place (BUGS.md Bug #17), not
+        copied, so (a) if this retry executes a tool and then still fails/returns
+        None, whatever it ran is still visible to stream_think() for the next
+        model in its fallback chain, and (b) an exact-repeat call already executed
+        earlier this turn -- by this retry or any prior model attempt -- is
+        reused instead of re-run.
+
         Returns the final response text, or None if the retry is also empty/fails.
         """
-        tool_history = []
         next_contents = contents
 
         for iteration in range(MAX_TOOL_ITERATIONS):
@@ -287,21 +369,15 @@ class PrimaryBrain:
             func_args = getattr(call, "args", {})
             func_args_dict = dict(func_args) if isinstance(func_args, dict) or hasattr(func_args, "items") else {}
 
-            tool_result = execute_tool_call(
+            _execute_tool_with_dedup(
                 func_name,
                 func_args_dict,
-                action_callback=action_callback,
-                display_callback=display_callback,
+                tool_history,
+                executed_calls,
+                action_callback,
+                display_callback,
             )
-            tool_history.append(f"[Tool '{func_name}' executed. Output: \"{tool_result}\"]")
-            next_contents = (
-                f"{timed_prompt}\n\n" + "\n\n".join(tool_history) +
-                "\n\nIf this fully answers the request, synthesize a concise, "
-                "natural, polite spoken J.A.R.V.I.S. response now -- never claim "
-                "an action succeeded if the tool output above shows it did not. "
-                "If another tool call is genuinely still needed to finish the "
-                "request, call it."
-            )
+            next_contents = _build_contents_with_history(timed_prompt, tool_history)
 
         logger.warning(
             f"[PrimaryBrain] Model '{target_model}' (non-streaming retry) requested "
