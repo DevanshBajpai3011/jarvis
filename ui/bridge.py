@@ -196,7 +196,7 @@ class VoiceListenerWorker(QThread):
                 if detected and self.running and self.voice_enabled:
                     self.status_changed.emit("LISTENING")
                     wav_path = self.listener.record_phrase(
-                        duration=10.0,
+                        duration=getattr(config, "VAD_HARD_CAP_SECONDS", 10.0),
                         output_filename="temp_input.wav",
                         rms_callback=self.rms_updated.emit
                     )

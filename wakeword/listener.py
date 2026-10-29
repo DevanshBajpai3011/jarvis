@@ -36,7 +36,16 @@ class WakeWordListener:
         self.model_name = model_name or getattr(config, "WAKEWORD_NAME", "hey_jarvis")
         self.gain_scaler = getattr(config, "WAKEWORD_GAIN_SCALER", 2.0)
         self.audio_buffer = np.array([], dtype=np.int16)
-        
+
+        # Handoff slot for a recording stream pre-opened by listen_for_wakeword() before
+        # play_wake_cue() plays (BUGS.md Bug #10, fix attempt #2) -- record_phrase() picks
+        # this up if present instead of opening its own, eliminating the dead gap where no
+        # stream was open at all between the old detection stream closing and a new
+        # recording stream opening (previously measured at ~380ms on this machine, easily
+        # enough to lose the first spoken word).
+        self._pending_pa = None
+        self._pending_stream = None
+
         # Ensure openWakeWord models are available locally
         try:
             openwakeword.utils.download_models()
@@ -135,10 +144,39 @@ class WakeWordListener:
 
                         if score >= self.threshold:
                             print(f"\n[>>> WAKEWORD TRIGGERED <<<] Score: {score:.2f}\n")
-                            play_wake_cue()
                             self.oww_model.reset()
                             self.trigger_wake()
-                            
+
+                            # Open the recording stream BEFORE playing the wake cue and
+                            # before tearing down the detection stream, so real capture
+                            # is already live when the cue starts -- eliminates the dead
+                            # gap where no stream was open at all (BUGS.md Bug #10, fix
+                            # attempt #2). Best-effort: if this fails (e.g. the device
+                            # doesn't support a second simultaneous open), fall through
+                            # with no pending stream and record_phrase() opens its own
+                            # afterward exactly as before -- degraded, not broken.
+                            try:
+                                pending_pa = pyaudio.PyAudio()
+                                pending_chunk_samples = int(TARGET_RATE * 0.1)
+                                pending_stream = pending_pa.open(
+                                    format=pyaudio.paInt16,
+                                    channels=1,
+                                    rate=TARGET_RATE,
+                                    input=True,
+                                    frames_per_buffer=pending_chunk_samples,
+                                )
+                                self._pending_pa = pending_pa
+                                self._pending_stream = pending_stream
+                            except Exception as pending_err:
+                                print(
+                                    f"[WakeWordListener Warning] Could not pre-open "
+                                    f"recording stream before wake cue: {pending_err}"
+                                )
+                                self._pending_pa = None
+                                self._pending_stream = None
+
+                            play_wake_cue()
+
                             stream.stop_stream()
                             stream.close()
                             pa.terminate()
@@ -172,38 +210,128 @@ class WakeWordListener:
 
     def record_phrase(
         self,
-        duration: float = 10.0,
+        duration: float = None,
         output_filename: str = "temp_input.wav",
         sample_rate: int = TARGET_RATE,
         channels: int = 1,
         rms_callback: Optional[Callable[[float], None]] = None,
     ) -> str:
         """
-        Immediately after wake word trigger, records audio for fixed duration (or until silence)
-        and saves to output_filename.
+        Immediately after wake word trigger, records audio until dynamic trailing-silence
+        is detected or a hard maximum duration is reached, whichever comes first, and
+        saves to output_filename.
+
+        Endpointing (BUGS.md Bug #10 -- fix attempt #2, `[2026-09-26]`, PENDING LIVE
+        VERIFICATION, not yet confirmed; fix attempt #1 from `[2026-09-17]` did not
+        resolve the bug per real user voice testing). The first VAD_CALIBRATION_SECONDS
+        of this recording are used to measure this room's actual ambient noise level, and
+        the real speech/silence threshold is set dynamically as
+        ambient_stat * VAD_THRESHOLD_MULTIPLIER -- not a flat constant. RMS is computed
+        from the signal after the same software pre-gain (self.gain_scaler) applied in
+        listen_for_wakeword() -- silence detection must judge the same boosted signal the
+        rest of the pipeline already relies on, not the raw, quieter one. The gain is
+        applied only for the RMS/threshold decision; the WAV saved to disk is still the
+        original, unboosted audio, to avoid any gain-related clipping artifacts degrading
+        STT accuracy.
+
+        Calibration statistic (changed in fix attempt #2): a high percentile (90th) of the
+        calibration window, not the mean. Fix attempt #1 used mean-of-4-chunks (0.4s) and
+        a fixed VAD_MIN_THRESHOLD=150.0 as a safety floor; real voice testing then measured
+        actual ambient floors of 6.8-72 RMS across four separate real recordings, all of
+        which produced the exact same effective threshold of 150 -- the floor was
+        dominating in every real case, collapsing "dynamic" calibration back into a static
+        value. The floor itself was the wrong mechanism: no fixed constant can correctly
+        sit above every anomalously-quiet mean-of-a-tiny-sample while also staying below
+        every real room's normal ambient level, because those two things overlap. A
+        percentile over a slightly longer window (VAD_CALIBRATION_SECONDS, 0.4->0.7s) is
+        naturally robust to a momentary quiet instant without needing a rescuing floor --
+        VAD_MIN_THRESHOLD is now 20.0, a true degenerate-case guard (a calibration reading
+        at or near true zero) rather than the primary mechanism.
+
+        Known limitation: if the user starts speaking immediately upon wake-word trigger,
+        within the calibration window, that speech gets folded into the "ambient" sample,
+        inflating the floor and threshold. Not fully solved here -- flagged in CHANGELOG.md.
+
+        Onset debounce: a single chunk above threshold does not by itself mark speech as
+        started -- VAD_ONSET_SECONDS of *sustained* above-threshold audio is required
+        first. Without this, live testing showed a brief transient (not real speech)
+        could flag speech_started=True, after which normal quiet ambient audio reads as
+        trailing silence and ends the recording early, capturing nothing real.
+
+        Known limitation, inherent to pure RMS-based endpointing (pre-dates this fix, not
+        introduced by it): this cannot distinguish continued speech from other loud,
+        non-speech noise (typing, a chair creak, background chatter) once speech_started
+        is True -- either keeps resetting silence_counter, so the recording can run to
+        the full hard cap even after the user has actually finished talking. Live testing
+        observed this directly. A real fix would need content-aware voice activity
+        detection, not just loudness; out of scope here.
+
+        Stream pre-opening (fix attempt #2, front-clipping): if listen_for_wakeword()
+        pre-opened a recording stream before playing the wake cue (see that method), this
+        picks it up instead of opening a fresh one, so capture was already live during the
+        cue -- eliminating the dead gap (measured ~380ms on this machine) where no stream
+        was open at all between the old detection stream closing and a new one opening,
+        which was losing the first spoken word. Falls back to opening its own stream if no
+        pending one exists or its format doesn't match the requested sample_rate/channels.
         """
+        if duration is None:
+            duration = getattr(config, "VAD_HARD_CAP_SECONDS", 10.0)
+        trailing_silence_seconds = getattr(config, "VAD_TRAILING_SILENCE_SECONDS", 2.0)
+        threshold_multiplier = getattr(config, "VAD_THRESHOLD_MULTIPLIER", 1.4)
+        calibration_seconds = getattr(config, "VAD_CALIBRATION_SECONDS", 0.7)
+        onset_seconds = getattr(config, "VAD_ONSET_SECONDS", 0.2)
+        min_threshold = getattr(config, "VAD_MIN_THRESHOLD", 20.0)
+
         print(f"[WakeWordListener] Recording phrase (max {duration}s)...", flush=True)
         chunk_duration = 0.1
         chunk_samples = int(sample_rate * chunk_duration)
         max_chunks = int(duration / chunk_duration)
-        silence_target_chunks = int(1.2 / chunk_duration)
+        silence_target_chunks = max(1, int(trailing_silence_seconds / chunk_duration))
+        calibration_chunks = max(1, int(calibration_seconds / chunk_duration))
+        onset_target_chunks = max(1, int(onset_seconds / chunk_duration))
 
         audio_chunks = []
+        calibration_rms_values = []
+        speech_threshold = None
         speech_started = False
+        onset_counter = 0
         silence_counter = 0
 
-        pa = pyaudio.PyAudio()
-        try:
-            stream = pa.open(
-                format=pyaudio.paInt16,
-                channels=channels,
-                rate=sample_rate,
-                input=True,
-                frames_per_buffer=chunk_samples
-            )
-        except Exception as e:
-            print(f"[WakeWordListener Error] PyAudio init error for recording: {e}")
-            return ""
+        # Reuse a stream listen_for_wakeword() pre-opened before the wake cue, if one
+        # exists and matches this call's requested format -- see the docstring above and
+        # BUGS.md Bug #10 (fix attempt #2). Otherwise open fresh, exactly as before.
+        pa = None
+        stream = None
+        if self._pending_stream is not None and self._pending_pa is not None:
+            if sample_rate == TARGET_RATE and channels == 1:
+                pa = self._pending_pa
+                stream = self._pending_stream
+                print("[WakeWordListener] Reusing pre-opened recording stream (no post-cue gap).", flush=True)
+            else:
+                # Format mismatch -- discard the pending stream rather than risk
+                # capturing at the wrong rate/channel count.
+                try:
+                    self._pending_stream.stop_stream()
+                    self._pending_stream.close()
+                    self._pending_pa.terminate()
+                except Exception:
+                    pass
+            self._pending_pa = None
+            self._pending_stream = None
+
+        if stream is None:
+            pa = pyaudio.PyAudio()
+            try:
+                stream = pa.open(
+                    format=pyaudio.paInt16,
+                    channels=channels,
+                    rate=sample_rate,
+                    input=True,
+                    frames_per_buffer=chunk_samples
+                )
+            except Exception as e:
+                print(f"[WakeWordListener Error] PyAudio init error for recording: {e}")
+                return ""
 
         try:
             for _ in range(max_chunks):
@@ -211,7 +339,10 @@ class WakeWordListener:
                 data = np.frombuffer(raw_data, dtype=np.int16)
                 audio_chunks.append(data.copy())
 
-                rms = float(np.sqrt(np.mean(data.astype(np.float32) ** 2)))
+                # Same software pre-gain applied to wake-word detection -- silence
+                # detection must judge the boosted signal, not the raw, quieter one.
+                boosted = np.clip(data.astype(np.float32) * self.gain_scaler, -32768, 32767)
+                rms = float(np.sqrt(np.mean(boosted ** 2)))
                 if rms_callback:
                     try:
                         norm_rms = min(1.0, rms / 1200.0)
@@ -219,14 +350,47 @@ class WakeWordListener:
                     except Exception:
                         pass
 
-                if rms > 300:
-                    speech_started = True
-                    silence_counter = 0
+                if speech_threshold is None:
+                    calibration_rms_values.append(rms)
+                    if len(calibration_rms_values) >= calibration_chunks:
+                        # 90th percentile, not mean (fix attempt #2) -- a plain mean over
+                        # a short window is easily dragged down by one momentary quiet
+                        # instant, producing an unrepresentatively low ambient estimate.
+                        # The 90th percentile reflects the louder, more typical tail of
+                        # the calibration window instead, so it's naturally robust to a
+                        # brief lull without needing a rescuing absolute floor to do the
+                        # real work (see config.py for the fix attempt #1 failure mode
+                        # this replaces). VAD_MIN_THRESHOLD below is now only a true
+                        # degenerate-case guard, not the primary mechanism.
+                        ambient_stat = float(np.percentile(calibration_rms_values, 90))
+                        speech_threshold = max(ambient_stat * threshold_multiplier, min_threshold)
+                        print(
+                            f"[WakeWordListener] Ambient level calibrated at "
+                            f"{ambient_stat:.1f} RMS (90th pct) -> speech threshold "
+                            f"{speech_threshold:.1f} (x{threshold_multiplier}).",
+                            flush=True,
+                        )
+                    continue
+
+                if rms > speech_threshold:
+                    if speech_started:
+                        silence_counter = 0
+                    else:
+                        onset_counter += 1
+                        if onset_counter >= onset_target_chunks:
+                            speech_started = True
+                            silence_counter = 0
+                        # else: still confirming a sustained onset, not yet real speech
                 else:
+                    onset_counter = 0
                     if speech_started:
                         silence_counter += 1
                         if silence_counter >= silence_target_chunks:
-                            print("[WakeWordListener] End of phrase detected (1.2s silence).", flush=True)
+                            print(
+                                f"[WakeWordListener] End of phrase detected "
+                                f"({trailing_silence_seconds}s silence).",
+                                flush=True,
+                            )
                             break
         except Exception as e:
             print(f"[WakeWordListener Error] Failed to record audio phrase: {e}")
@@ -314,7 +478,7 @@ class WakeWordListener:
 
         # Voice activity detected -> Record phrase
         return self.record_phrase(
-            duration=10.0,
+            duration=getattr(config, "VAD_HARD_CAP_SECONDS", 10.0),
             output_filename="temp_input.wav",
             sample_rate=sample_rate,
             rms_callback=rms_callback,
