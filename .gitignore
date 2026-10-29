@@ -8,5 +8,6 @@ memory/chroma_db/
 temp*/
 .claude/
 *.md
+!README.md
 *.log
 tools/reminders.json
