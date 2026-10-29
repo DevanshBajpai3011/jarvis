@@ -5,7 +5,8 @@ venv/
 .venv/
 *.wav
 memory/chroma_db/
-temp/
-temp_vision/
+temp*/
 .claude/
-
+*.md
+*.log
+tools/reminders.json
